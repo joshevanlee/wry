@@ -560,7 +560,8 @@ impl InnerWebView {
       // already set that controller up, it holds that web view's user scripts; adding ours as
       // well would run every script again in every web view on it, so this web view runs the
       // opener's scripts instead. For Tauri that includes the per-window metadata script, so the
-      // page sees the opener's labels.
+      // page sees the opener's labels. Only web views with an IPC handler count as setting a
+      // controller up; after an opener without one, the scripts are added again, as before.
       let reuses_opener_scripts = with_registry(mtm, |registry| {
         registry.is_shared(ControllerAddress::of(&manager))
       });

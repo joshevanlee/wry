@@ -54,6 +54,7 @@ struct Entry<H> {
 
 /// Result of [`IpcRegistry::insert`].
 #[derive(Debug)]
+#[must_use = "act on `first_on_controller` and drop `replaced` after the registry borrow"]
 pub struct Insertion<H> {
   /// The web view is the first live one on its controller: the caller adds the "ipc" handler.
   pub first_on_controller: bool,
@@ -63,6 +64,7 @@ pub struct Insertion<H> {
 
 /// Result of [`IpcRegistry::remove`].
 #[derive(Debug)]
+#[must_use = "act on `last_on_controller` and drop `handler` after the registry borrow"]
 pub struct Removal<H> {
   /// The web view was the last live one on its controller: the caller removes the "ipc" handler.
   pub last_on_controller: bool,
@@ -118,6 +120,7 @@ impl<H> IpcRegistry<H> {
 
   /// Unregisters `webview` from the controller it was registered on, or returns `None` if it
   /// is not registered.
+  #[must_use = "act on the removal and drop its handler after the registry borrow"]
   pub fn remove(&mut self, webview: WebViewAddress) -> Option<Removal<H>> {
     let Entry {
       controller,
@@ -136,7 +139,9 @@ impl<H> IpcRegistry<H> {
   }
 
   /// Whether a live web view is registered on `controller`, i.e. wry has already added the
-  /// "ipc" handler and its user scripts to it.
+  /// "ipc" handler and its user scripts to it. Only web views with an IPC handler register, so
+  /// a controller set up by an opener without one is not shared, and the next web view adds its
+  /// user scripts again (wry's behaviour before the registry).
   pub fn is_shared(&self, controller: ControllerAddress) -> bool {
     self.controller_users.contains_key(&controller)
   }
@@ -180,8 +185,8 @@ mod tests {
 
   fn main_and_pop_out() -> IpcRegistry<&'static str> {
     let mut registry = IpcRegistry::default();
-    registry.insert(CONTROLLER, MAIN, "main");
-    registry.insert(CONTROLLER, POP_OUT, "pop-out");
+    let _ = registry.insert(CONTROLLER, MAIN, "main");
+    let _ = registry.insert(CONTROLLER, POP_OUT, "pop-out");
     registry
   }
 
@@ -251,9 +256,9 @@ mod tests {
   #[test]
   fn remove_uses_the_controller_the_web_view_was_registered_on() {
     let mut registry = main_and_pop_out();
-    registry.insert(OTHER_CONTROLLER, OTHER_WEB_VIEW, "other");
-    registry.remove(MAIN);
-    registry.remove(POP_OUT);
+    let _ = registry.insert(OTHER_CONTROLLER, OTHER_WEB_VIEW, "other");
+    let _ = registry.remove(MAIN);
+    let _ = registry.remove(POP_OUT);
     assert!(!registry.is_shared(CONTROLLER));
     assert!(registry.is_shared(OTHER_CONTROLLER));
   }
@@ -262,16 +267,16 @@ mod tests {
   fn is_shared_while_a_web_view_is_registered() {
     let mut registry = IpcRegistry::default();
     assert!(!registry.is_shared(CONTROLLER));
-    registry.insert(CONTROLLER, MAIN, "main");
+    let _ = registry.insert(CONTROLLER, MAIN, "main");
     assert!(registry.is_shared(CONTROLLER));
-    registry.remove(MAIN);
+    let _ = registry.remove(MAIN);
     assert!(!registry.is_shared(CONTROLLER));
   }
 
   #[test]
   fn registering_again_returns_the_replaced_handler() {
     let mut registry = IpcRegistry::default();
-    registry.insert(CONTROLLER, MAIN, "main");
+    let _ = registry.insert(CONTROLLER, MAIN, "main");
     let insertion = registry.insert(CONTROLLER, MAIN, "main again");
     assert!(!insertion.first_on_controller);
     assert_eq!(insertion.replaced, Some("main"));
@@ -283,7 +288,7 @@ mod tests {
   fn removing_an_unregistered_web_view_changes_nothing() {
     let mut registry = main_and_pop_out();
     assert!(registry.remove(UNREGISTERED).is_none());
-    registry.remove(MAIN);
+    let _ = registry.remove(MAIN);
     assert!(registry.remove(MAIN).is_none());
     assert!(registry.remove(POP_OUT).unwrap().last_on_controller);
   }

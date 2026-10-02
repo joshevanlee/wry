@@ -123,31 +123,38 @@ impl WryWebViewDelegate {
     // Drop a replaced handler outside the registry borrow.
     drop(insertion.replaced);
     if insertion.first_on_controller {
-      let proto_delegate = ProtocolObject::from_ref(&*delegate);
-      // SAFETY: a documented `WKUserContentController` call on the main thread (`mtm`); an
-      // Objective-C exception is caught rather than unwinding into Rust.
-      let added = unsafe {
-        // this will increase the retain count of the delegate, which then stays alive until the
-        // last web view on the controller removes it in `unregister`
-        objc2::exception::catch(AssertUnwindSafe(|| {
-          delegate
-            .ivars()
-            .controller
-            .addScriptMessageHandler_name(proto_delegate, ns_string!(IPC_MESSAGE_HANDLER_NAME));
-        }))
-      };
-      if let Err(_exception) = added {
-        #[cfg(feature = "tracing")]
-        tracing::warn!(
-          "Failed to add the IPC script message handler: {:?}",
-          _exception
-        );
-        // The controller has no handler of ours, so it must not count as shared by wry.
-        let _removal = with_registry(mtm, |registry| registry.remove(webview));
-      }
+      delegate.add_ipc_handler_or_rollback(webview, mtm);
     }
 
     delegate
+  }
+
+  /// Adds this delegate as the controller's "ipc" script message handler. If WebKit refuses,
+  /// unregisters `webview` again, so the controller does not count as shared by wry.
+  fn add_ipc_handler_or_rollback(&self, webview: WebViewAddress, mtm: MainThreadMarker) {
+    let proto_delegate = ProtocolObject::from_ref(self);
+    // SAFETY: a documented `WKUserContentController` call on the main thread (`mtm`); an
+    // Objective-C exception is caught rather than unwinding into Rust.
+    let added = unsafe {
+      // this will increase the retain count of the delegate, which then stays alive until the
+      // last web view on the controller removes it in `unregister`
+      objc2::exception::catch(AssertUnwindSafe(|| {
+        self
+          .ivars()
+          .controller
+          .addScriptMessageHandler_name(proto_delegate, ns_string!(IPC_MESSAGE_HANDLER_NAME));
+      }))
+    };
+    if let Err(_exception) = added {
+      #[cfg(feature = "tracing")]
+      tracing::warn!(
+        "Failed to add the IPC script message handler: {:?}",
+        _exception
+      );
+      let removal = with_registry(mtm, |registry| registry.remove(webview));
+      // Drop the removed handler outside the registry borrow.
+      drop(removal);
+    }
   }
 
   /// Unregisters the web view at `webview`. The last live web view on the controller removes the

@@ -10,10 +10,15 @@ use objc2::{
   define_class, msg_send, rc::Retained, runtime::NSObject, DefinedClass, MainThreadOnly,
 };
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSModalResponse, NSModalResponseOK, NSOpenPanel, NSWindowDelegate};
+use objc2::runtime::Bool;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+  NSAlert, NSAlertFirstButtonReturn, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSTextField,
+  NSWindowDelegate,
+};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSArray, NSURL};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString, NSURL};
 
 #[cfg(target_os = "macos")]
 use objc2_web_kit::WKOpenPanelParameters;
@@ -79,6 +84,29 @@ impl WryNSWindowDelegate {
   }
 }
 
+/// The alert for a page's panel. Apple asks that it "call attention to the
+/// fact that a specific website controls the content in this panel"
+/// (WKUIDelegate), so its heading names the page's host.
+#[cfg(target_os = "macos")]
+fn page_panel(
+  mtm: MainThreadMarker,
+  message: &NSString,
+  frame: &WKFrameInfo,
+  buttons: &[&str],
+) -> Retained<NSAlert> {
+  let panel = NSAlert::new(mtm);
+  let host = unsafe { frame.request().URL() }
+    .and_then(|url| url.host())
+    .map(|host| host.to_string())
+    .unwrap_or_default();
+  panel.setMessageText(&NSString::from_str(&host));
+  panel.setInformativeText(message);
+  for button in buttons {
+    panel.addButtonWithTitle(&NSString::from_str(button));
+  }
+  panel
+}
+
 pub struct WryWebViewUIDelegateIvars {
   #[cfg(target_os = "macos")]
   new_window_req_handler: Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse>>,
@@ -121,6 +149,69 @@ define_class!(
             (*handler).call((null_mut(),));
           }
         }
+      }
+    }
+
+    // A page's alert(), confirm() and prompt(). Without these WebKit methods
+    // the panels never show: confirm() reads as Cancel and prompt() as null.
+    #[cfg(target_os = "macos")]
+    #[unsafe(method(webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:))]
+    fn run_javascript_alert_panel(
+      &self,
+      _webview: &WryWebView,
+      message: &NSString,
+      frame: &WKFrameInfo,
+      handler: &block2::Block<dyn Fn()>,
+    ) {
+      if let Some(mtm) = MainThreadMarker::new() {
+        page_panel(mtm, message, frame, &["OK"]).runModal();
+      }
+      handler.call(());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[unsafe(method(webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:))]
+    fn run_javascript_confirm_panel(
+      &self,
+      _webview: &WryWebView,
+      message: &NSString,
+      frame: &WKFrameInfo,
+      handler: &block2::Block<dyn Fn(Bool)>,
+    ) {
+      let confirmed = MainThreadMarker::new().is_some_and(|mtm| {
+        page_panel(mtm, message, frame, &["OK", "Cancel"]).runModal() == NSAlertFirstButtonReturn
+      });
+      handler.call((Bool::new(confirmed),));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[unsafe(method(webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:))]
+    fn run_javascript_text_input_panel(
+      &self,
+      _webview: &WryWebView,
+      prompt: &NSString,
+      default_text: Option<&NSString>,
+      frame: &WKFrameInfo,
+      handler: &block2::Block<dyn Fn(*mut NSString)>,
+    ) {
+      let Some(mtm) = MainThreadMarker::new() else {
+        return handler.call((null_mut(),));
+      };
+      let panel = page_panel(mtm, prompt, frame, &["OK", "Cancel"]);
+      let field = NSTextField::initWithFrame(
+        mtm.alloc(),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(260.0, 24.0)),
+      );
+      if let Some(default_text) = default_text {
+        field.setStringValue(default_text);
+      }
+      panel.setAccessoryView(Some(&field));
+      panel.window().setInitialFirstResponder(Some(&field));
+      if panel.runModal() == NSAlertFirstButtonReturn {
+        let text = field.stringValue();
+        handler.call((Retained::as_ptr(&text) as *mut NSString,));
+      } else {
+        handler.call((null_mut(),));
       }
     }
 

@@ -189,6 +189,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSMenu",
   "NSGraphics",
   "NSScreen",
+  "NSAlert",
+  "NSTextField",
 ] }
 
 [target."cfg(target_os = \"android\")".dependencies]

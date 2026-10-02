@@ -16,7 +16,7 @@ use http::{
 use objc2::{
   rc::Retained,
   runtime::{AnyClass, AnyObject, ClassBuilder, ProtocolObject},
-  AllocAnyThread, ClassType, Message,
+  AllocAnyThread, ClassType, DeclaredClass, Message,
 };
 use objc2_foundation::{
   NSData, NSHTTPURLResponse, NSMutableDictionary, NSObject, NSObjectProtocol, NSString, NSURL,
@@ -37,7 +37,7 @@ pub fn create(name: &str) -> &AnyClass {
     match cls {
       Some(mut cls) => {
         cls.add_ivar::<*mut c_char>(c"webview_id");
-        cls.add_ivar::<usize>(c"protocol_index");
+        cls.add_ivar::<*mut c_char>(c"scheme");
         cls.add_method(
           objc2::sel!(webView:startURLSchemeTask:),
           start_task as extern "C" fn(_, _, _, _),
@@ -68,26 +68,33 @@ extern "C" fn start_task(
   let task_key = task.hash(); // hash by task object address
   let task_uuid = webview.add_custom_task_key(task_key);
 
-  let ivar = this.class().instance_variable(c"webview_id").unwrap();
-  let webview_id = unsafe {
-    let webview_id_ptr: *mut c_char = *ivar.load(this);
-    CStr::from_ptr(webview_id_ptr)
-      .to_str()
-      .ok()
-      .unwrap_or_default()
+  // SAFETY: both ivars are set to `CString::into_raw` pointers right after the handler is created
+  // and never freed, so they stay valid for the life of the process.
+  let (registering_webview_id, scheme) = unsafe {
+    let load = |name: &CStr| {
+      let ivar = this.class().instance_variable(name).unwrap();
+      let ptr: *mut c_char = *ivar.load(this);
+      CStr::from_ptr(ptr).to_str().ok().unwrap_or_default()
+    };
+    (load(c"webview_id"), load(c"scheme"))
   };
 
-  let ivar = this.class().instance_variable(c"protocol_index").unwrap();
-  let protocol_index: usize = unsafe { *ivar.load(this) };
+  // A configuration from `with_webview_configuration` (Tauri's pop-out recipe) shares this handler
+  // object with every web view built from it, so attribute the task to the web view WebKit passes
+  // here, the one the task belongs to
+  // <https://developer.apple.com/documentation/webkit/wkurlschemehandler/webview(_:start:)>.
+  // Fall back to the web view that registered the handler, as before.
+  let target = {
+    let state = WEBVIEW_STATE.read().unwrap();
+    [webview.ivars().webview_id.as_str(), registering_webview_id]
+      .into_iter()
+      .find_map(|id| {
+        let function = state.get(id)?.protocol_ptrs.get(scheme)?;
+        Some((id.to_string(), function.clone()))
+      })
+  };
 
-  let function = WEBVIEW_STATE
-    .read()
-    .unwrap()
-    .get(webview_id)
-    .and_then(|v| v.protocol_ptrs.get(protocol_index))
-    .cloned();
-
-  if let Some(function) = function {
+  if let Some((webview_id, function)) = target {
     // Get url request
     let request = unsafe { task.request() };
     let url = request.URL().unwrap();
@@ -186,9 +193,11 @@ extern "C" fn start_task(
       Ok(final_request) => {
         let webview = webview.retain();
         let task = task.retain();
+        let responder_webview_id = webview_id.clone();
         let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
           Box::new(move |sent_response| {
             // Consolidate checks before calling into `did*` methods.
+            let webview_id = responder_webview_id.as_str();
             let validate = || -> crate::Result<()> {
               check_webview_id_valid(webview_id)?;
               check_task_is_valid(&webview, task_key, task_uuid.clone())?;
@@ -318,7 +327,7 @@ extern "C" fn start_task(
         let _span = tracing::info_span!("wry::custom_protocol::call_handler").entered();
 
         function(
-          webview_id,
+          &webview_id,
           final_request,
           RequestAsyncResponder { responder },
         );

@@ -24,6 +24,8 @@ use objc2_ui_kit::UIEvent as NSEvent;
 use objc2_web_kit::WKWebView;
 
 pub struct WryWebViewIvars {
+  /// The wry id of this web view; custom protocol tasks are attributed to it.
+  pub(crate) webview_id: String,
   pub(crate) is_child: bool,
   #[cfg(target_os = "macos")]
   pub(crate) drag_drop_handler: Box<dyn Fn(DragDropEvent) -> bool>,

@@ -5,6 +5,7 @@
 mod download;
 #[cfg(target_os = "macos")]
 mod drag_drop;
+mod ipc_registry;
 mod navigation;
 #[cfg(feature = "mac-proxy")]
 mod proxy;
@@ -20,12 +21,9 @@ pub use class::wry_web_view::WryWebView;
 #[cfg(target_os = "macos")]
 use class::wry_web_view_parent::WryWebViewParent;
 use class::{
-  document_title_changed_observer::*,
-  url_scheme_handler,
-  wry_download_delegate::WryDownloadDelegate,
-  wry_navigation_delegate::WryNavigationDelegate,
-  wry_web_view::WryWebViewIvars,
-  wry_web_view_delegate::{WryWebViewDelegate, IPC_MESSAGE_HANDLER_NAME},
+  document_title_changed_observer::*, url_scheme_handler,
+  wry_download_delegate::WryDownloadDelegate, wry_navigation_delegate::WryNavigationDelegate,
+  wry_web_view::WryWebViewIvars, wry_web_view_delegate::WryWebViewDelegate,
   wry_web_view_ui_delegate::WryWebViewUIDelegate,
 };
 
@@ -35,7 +33,7 @@ use objc2::runtime::Bool;
 use objc2::{
   rc::Retained,
   runtime::{AnyObject, NSObject, ProtocolObject},
-  AllocAnyThread, DeclaredClass, MainThreadOnly, Message,
+  AllocAnyThread, MainThreadOnly, Message,
 };
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTitlebarSeparatorStyle, NSView};
@@ -109,8 +107,11 @@ static COUNTER: Counter = Counter::new();
 static WEBVIEW_STATE: Lazy<RwLock<HashMap<String, WebViewState>>> = Lazy::new(Default::default);
 
 struct WebViewState {
-  pub protocol_ptrs:
-    Vec<Rc<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync>>,
+  /// Custom protocol functions keyed by scheme name.
+  pub protocol_ptrs: HashMap<
+    String,
+    Rc<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync>,
+  >,
 }
 
 unsafe impl Send for WebViewState {}
@@ -248,8 +249,13 @@ impl InnerWebView {
       };
 
       // Register Custom Protocols
-      let mut protocol_ptrs = Vec::new();
+      // Each web view's functions are stored under its id even when the scheme handler is
+      // already registered: with a shared configuration (Tauri's `with_webview_configuration`)
+      // one handler object serves every web view, and it looks the function up by the web view
+      // WebKit passes to `webView:startURLSchemeTask:`.
+      let mut protocol_ptrs = HashMap::new();
       for (name, function) in attributes.custom_protocols {
+        protocol_ptrs.insert(name.clone(), Rc::from(function));
         // <https://developer.apple.com/documentation/webkit/wkwebviewconfiguration/urlschemehandler(forurlscheme:)>
         // Available: macOS 10.13+, iOS 11+
         let already_registered = using_existing_config
@@ -265,15 +271,10 @@ impl InnerWebView {
 
         let url_scheme_handler_cls = url_scheme_handler::create(&name);
         let handler: *mut AnyObject = objc2::msg_send![url_scheme_handler_cls, new];
-        let protocol_index = protocol_ptrs.len();
-        protocol_ptrs.push(Rc::from(function));
 
-        let ivar = (*handler)
-          .class()
-          .instance_variable(c"protocol_index")
-          .unwrap();
-        let ivar_delegate: &mut usize = ivar.load_mut(&mut *handler);
-        *ivar_delegate = protocol_index;
+        let ivar = (*handler).class().instance_variable(c"scheme").unwrap();
+        let ivar_delegate: &mut *mut c_char = ivar.load_mut(&mut *handler);
+        *ivar_delegate = CString::new(name.as_bytes()).unwrap().into_raw();
 
         let ivar = (*handler).class().instance_variable(c"webview_id").unwrap();
         let ivar_delegate: &mut *mut c_char = ivar.load_mut(&mut *handler);
@@ -300,6 +301,7 @@ impl InnerWebView {
       // WebView and manager
       let manager = config.userContentController();
       let webview = WryWebView::alloc(mtm).set_ivars(WryWebViewIvars {
+        webview_id: webview_id.clone(),
         is_child,
         #[cfg(target_os = "macos")]
         drag_drop_handler: match attributes.drag_drop_handler {
@@ -549,9 +551,17 @@ impl InnerWebView {
         _preference.setValue_forKey(Some(&_yes), ns_string!("developerExtrasEnabled"));
       }
 
+      // A configuration from `with_webview_configuration` (Tauri's pop-out recipe passes the
+      // opener's) shares the opener's `WKUserContentController`, which already holds the
+      // opener's user scripts. Adding ours as well would run every script again in every web
+      // view on that controller, so such a web view runs the opener's scripts instead: for Tauri
+      // that includes the per-window metadata script, so the page sees the opener's labels.
+      let reuses_opener_scripts = using_existing_config && manager.userScripts().count() > 0;
+
       // Message handler
       let ipc_handler_delegate = if let Some(ipc_handler) = attributes.ipc_handler {
-        let delegate = WryWebViewDelegate::new(manager.clone(), ipc_handler, mtm);
+        let webview_address = Retained::as_ptr(&webview) as usize;
+        let delegate = WryWebViewDelegate::new(manager.clone(), webview_address, ipc_handler, mtm);
         Some(delegate)
       } else {
         None
@@ -636,15 +646,17 @@ impl InnerWebView {
         parent_view: None,
       };
 
-      if w.ipc_handler_delegate.is_some() {
+      if w.ipc_handler_delegate.is_some() && !reuses_opener_scripts {
         // Initialize scripts
         w.init(
           r#"Object.defineProperty(window, 'ipc', { value: Object.freeze({ postMessage: function(s) { window.webkit.messageHandlers.ipc.postMessage(s) } }) });"#,
           true,
         );
       }
-      for init_script in attributes.initialization_scripts {
-        w.init(&init_script.script, init_script.for_main_frame_only);
+      if !reuses_opener_scripts {
+        for init_script in attributes.initialization_scripts {
+          w.init(&init_script.script, init_script.for_main_frame_only);
+        }
       }
 
       // Set user agent
@@ -1419,21 +1431,15 @@ impl Drop for InnerWebView {
     WEBVIEW_STATE.write().unwrap().remove(&self.id);
 
     // We need to drop handler closures here
-    unsafe {
-      if let Some(ipc_handler) = self.ipc_handler_delegate.take() {
-        let ipc = ns_string!(IPC_MESSAGE_HANDLER_NAME);
-        // this will decrease the retain count of the ipc handler and trigger the drop
-        ipc_handler
-          .ivars()
-          .controller
-          .removeScriptMessageHandlerForName(ipc);
-      }
-
-      // Remove webview from window's NSView before dropping.
-      self.webview.removeFromSuperview();
-      self.webview.retain();
-      self.manager.retain();
+    if let Some(ipc_handler) = self.ipc_handler_delegate.take() {
+      // Removes the shared "ipc" handler only when no other live web view uses the controller.
+      ipc_handler.unregister(Retained::as_ptr(&self.webview) as usize, self.mtm);
     }
+
+    // Remove webview from window's NSView before dropping.
+    self.webview.removeFromSuperview();
+    self.webview.retain();
+    self.manager.retain();
   }
 }
 

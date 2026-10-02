@@ -1,5 +1,5 @@
 use objc2::DeclaredClass;
-use objc2_foundation::{NSObjectProtocol, NSString};
+use objc2_foundation::{NSHTTPURLResponse, NSObjectProtocol, NSString};
 use objc2_web_kit::{
   WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationResponse,
   WKNavigationResponsePolicy,
@@ -92,7 +92,15 @@ pub(crate) fn navigation_policy_response(
   unsafe {
     let can_show_mime_type = response.canShowMIMEType();
 
-    if !can_show_mime_type {
+    // Like Safari, download responses marked `Content-Disposition: attachment`
+    // (RFC 6266) even when the type is displayable, such as a PDF.
+    let is_attachment = response
+      .response()
+      .downcast_ref::<NSHTTPURLResponse>()
+      .and_then(|http| http.valueForHTTPHeaderField(&NSString::from_str("Content-Disposition")))
+      .is_some_and(|value| is_attachment(&value.to_string()));
+
+    if !can_show_mime_type || is_attachment {
       let has_download_handler = this.ivars().has_download_handler;
       if has_download_handler {
         (*handler).call((WKNavigationResponsePolicy::Download,));
@@ -112,5 +120,28 @@ pub(crate) fn web_content_process_did_terminate(
     &this.ivars().on_web_content_process_terminate_handler
   {
     on_web_content_process_terminate();
+  }
+}
+
+/// Whether a `Content-Disposition` value has the disposition type `attachment`
+/// (RFC 6266: the token before the first `;`, case-insensitive).
+fn is_attachment(content_disposition: &str) -> bool {
+  let disposition_type = content_disposition.split(';').next().unwrap_or("");
+  disposition_type.trim().eq_ignore_ascii_case("attachment")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::is_attachment;
+
+  #[test]
+  fn is_attachment_checks_disposition_type() {
+    assert!(is_attachment("attachment"));
+    assert!(is_attachment("attachment; filename=\"a.pdf\""));
+    assert!(is_attachment("  Attachment ;filename=a.pdf"));
+    assert!(!is_attachment("inline"));
+    assert!(!is_attachment("inline; filename=\"a.pdf\""));
+    assert!(!is_attachment(""));
+    assert!(!is_attachment("attachments"));
   }
 }

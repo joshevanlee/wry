@@ -152,6 +152,17 @@ define_class!(
       }
     }
 
+    // A page's window.close(): WebKit asks the app to close "the containing
+    // browser tab or window" (WKUIDelegate webViewDidClose:). Closing it like
+    // the close button lets the app's own close handling run.
+    #[cfg(target_os = "macos")]
+    #[unsafe(method(webViewDidClose:))]
+    fn web_view_did_close(&self, webview: &WryWebView) {
+      if let Some(window) = webview.window() {
+        window.performClose(None);
+      }
+    }
+
     // A page's alert(), confirm() and prompt(). Without these WebKit methods
     // the panels never show: confirm() reads as Cancel and prompt() as null.
     #[cfg(target_os = "macos")]

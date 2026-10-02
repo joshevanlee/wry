@@ -26,6 +26,7 @@ use class::{
   wry_web_view::WryWebViewIvars, wry_web_view_delegate::WryWebViewDelegate,
   wry_web_view_ui_delegate::WryWebViewUIDelegate,
 };
+use ipc_registry::{with_registry, ControllerAddress, WebViewAddress};
 
 use dpi::{LogicalPosition, LogicalSize};
 #[cfg(target_os = "macos")]
@@ -272,13 +273,16 @@ impl InnerWebView {
         let url_scheme_handler_cls = url_scheme_handler::create(&name);
         let handler: *mut AnyObject = objc2::msg_send![url_scheme_handler_cls, new];
 
+        // SAFETY: `url_scheme_handler::create` declares `scheme` and `webview_id` as
+        // `*mut c_char` ivars, and `handler` was just created, so nothing else reads them yet.
+        // The `CString`s are leaked on purpose: the handler can outlive this web view.
         let ivar = (*handler).class().instance_variable(c"scheme").unwrap();
-        let ivar_delegate: &mut *mut c_char = ivar.load_mut(&mut *handler);
-        *ivar_delegate = CString::new(name.as_bytes()).unwrap().into_raw();
+        let scheme_ivar: &mut *mut c_char = ivar.load_mut(&mut *handler);
+        *scheme_ivar = CString::new(name.as_bytes()).unwrap().into_raw();
 
         let ivar = (*handler).class().instance_variable(c"webview_id").unwrap();
-        let ivar_delegate: &mut *mut c_char = ivar.load_mut(&mut *handler);
-        *ivar_delegate = CString::new(webview_id.as_bytes()).unwrap().into_raw();
+        let webview_id_ivar: &mut *mut c_char = ivar.load_mut(&mut *handler);
+        *webview_id_ivar = CString::new(webview_id.as_bytes()).unwrap().into_raw();
 
         let set_result = objc2::exception::catch(AssertUnwindSafe(|| {
           // <https://developer.apple.com/documentation/webkit/wkwebviewconfiguration/seturlschemehandler(_:forurlscheme:)>
@@ -552,15 +556,18 @@ impl InnerWebView {
       }
 
       // A configuration from `with_webview_configuration` (Tauri's pop-out recipe passes the
-      // opener's) shares the opener's `WKUserContentController`, which already holds the
-      // opener's user scripts. Adding ours as well would run every script again in every web
-      // view on that controller, so such a web view runs the opener's scripts instead: for Tauri
-      // that includes the per-window metadata script, so the page sees the opener's labels.
-      let reuses_opener_scripts = using_existing_config && manager.userScripts().count() > 0;
+      // opener's) shares the opener's `WKUserContentController`. When a live wry web view has
+      // already set that controller up, it holds that web view's user scripts; adding ours as
+      // well would run every script again in every web view on it, so this web view runs the
+      // opener's scripts instead. For Tauri that includes the per-window metadata script, so the
+      // page sees the opener's labels.
+      let reuses_opener_scripts = with_registry(mtm, |registry| {
+        registry.is_shared(ControllerAddress::of(&manager))
+      });
 
       // Message handler
       let ipc_handler_delegate = if let Some(ipc_handler) = attributes.ipc_handler {
-        let webview_address = Retained::as_ptr(&webview) as usize;
+        let webview_address = WebViewAddress::of(&webview);
         let delegate = WryWebViewDelegate::new(manager.clone(), webview_address, ipc_handler, mtm);
         Some(delegate)
       } else {
@@ -1430,10 +1437,12 @@ impl Drop for InnerWebView {
   fn drop(&mut self) {
     WEBVIEW_STATE.write().unwrap().remove(&self.id);
 
-    // We need to drop handler closures here
+    // Unregister this web view's IPC handler. The shared "ipc" script message handler is removed
+    // only when no other live web view uses the controller; until then, if this web view's
+    // delegate is the one added to the controller, the controller keeps it (and its closure, as
+    // the fallback handler) alive.
     if let Some(ipc_handler) = self.ipc_handler_delegate.take() {
-      // Removes the shared "ipc" handler only when no other live web view uses the controller.
-      ipc_handler.unregister(Retained::as_ptr(&self.webview) as usize, self.mtm);
+      ipc_handler.unregister(WebViewAddress::of(&self.webview), self.mtm);
     }
 
     // Remove webview from window's NSView before dropping.

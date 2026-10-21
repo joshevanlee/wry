@@ -16,5 +16,7 @@ CI runs the workflows in `.github/workflows/`:
 
 Policy: fleet-docs `STANDARDS.md`, "Shipping a verified change".
 
+Worktrees: follow fleet-docs `STANDARDS.md`, 'Concurrent agents — one worktree per task'.
+
 - Merge to this fork's `dev`, not to `tauri-apps/wry`, once CI is green.
 - A merge deploys nothing. The crate is released through the covector workflows (`covector-*.yml`, `.changes/`), which are outside the ship loop.
